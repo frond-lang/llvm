@@ -22,7 +22,9 @@ jobs:
           - { os: ubuntu-latest,    triple: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu }
           - { os: macos-latest,     triple: aarch64-apple-darwin }
-          - { os: macos-13,         triple: x86_64-apple-darwin }
+          # Intel macOS runners are retired; cross-compile x86_64 on arm64
+          # (Rosetta runs the x86_64 tablegen binaries).
+          - { os: macos-latest,     triple: x86_64-apple-darwin, osx_arch: x86_64 }
           - { os: windows-latest,   triple: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
 
@@ -42,10 +44,12 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             EXTRA="-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DLLVM_ENABLE_DIA_SDK=OFF"
           fi
+          if [ -n "${{ matrix.osx_arch }}" ]; then
+            EXTRA="$EXTRA -DCMAKE_OSX_ARCHITECTURES=${{ matrix.osx_arch }}"
+          fi
           cmake -S llvm -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -D LLVM_TARGETS_TO_BUILD="X86;AArch64" \
-            -DLLVM_BUILD_LLVM_C_DYLIB=ON \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
@@ -58,10 +62,19 @@ jobs:
             -DLLVM_APPEND_VC_REV=OFF \
             $EXTRA
 
-      # One target works on all platforms: it drags in every component static
-      # archive as a dependency. The produced .so/.dll itself is discarded.
+      # llvm-libraries: aggregate target that depends on every LLVM component
+      # library; works uniformly on all platforms (LLVM_BUILD_LLVM_C_DYLIB is
+      # only supported on Darwin/MSVC, so it is left at its platform default).
+      # Windows additionally builds LLVM-C (on by default under MSVC) to get
+      # the dll + the ordered libllvm-c.args link manifest.
       - name: Build
-        run: cmake --build build --target LLVM-C
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmake --build build --target llvm-libraries LLVM-C
+          else
+            cmake --build build --target llvm-libraries
+          fi
 
       - name: Package
         shell: bash
@@ -92,7 +105,7 @@ jobs:
           tag_name: ${{ inputs.release_tag }}
           generate_release_notes: true
           body: |
-            Static LLVM ${{ inputs.release_tag }} libraries built from branch slim-21.1.8.
+            Static LLVM libraries built from branch slim-21.1.8.
             X86 + AArch64 codegen, no zlib/zstd/libxml2, static CRT on Windows (/MT).
             Each archive contains: lib/ (component static archives), include/,
             libllvm.cpp (C API wrapper — compile it on the consumer side),
