@@ -1,0 +1,6 @@
+# Local build outputs — never commit (an accidental `git add .` once pushed
+# 1.1G of artifacts; this file exists so that cannot recur).
+build-slim/
+build-verify/
+build/
+*.log
