@@ -1,0 +1,103 @@
+name: llvm-static
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to attach static-lib assets to (created if missing)'
+        required: true
+        default: 'llvm-static-21.1.8'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.triple }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    triple: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu }
+          - { os: macos-latest,     triple: aarch64-apple-darwin }
+          - { os: macos-13,         triple: x86_64-apple-darwin }
+          - { os: windows-latest,   triple: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        shell: bash
+        run: |
+          EXTRA=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            EXTRA="-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DLLVM_ENABLE_DIA_SDK=OFF"
+          fi
+          cmake -S llvm -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -D LLVM_TARGETS_TO_BUILD="X86;AArch64" \
+            -DLLVM_BUILD_LLVM_C_DYLIB=ON \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_PLUGINS=OFF \
+            -DLLVM_APPEND_VC_REV=OFF \
+            $EXTRA
+
+      # One target works on all platforms: it drags in every component static
+      # archive as a dependency. The produced .so/.dll itself is discarded.
+      - name: Build
+        run: cmake --build build --target LLVM-C
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          NAME="llvm-static-${{ matrix.triple }}"
+          mkdir -p "dist/$NAME/lib" "dist/$NAME/include"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp build/lib/*.lib "dist/$NAME/lib/"
+            cp build/bin/LLVM-C.dll "dist/$NAME/lib/" 2>/dev/null || true
+            cp build/libllvm-c.args "dist/$NAME/" 2>/dev/null || true
+          else
+            cp build/lib/*.a "dist/$NAME/lib/"
+          fi
+          # Headers: source tree + generated Config headers merged.
+          cp -R llvm/include/. "dist/$NAME/include/"
+          cp -R build/include/. "dist/$NAME/include/"
+          # C API wrapper source: consumer compiles it for true-static linking
+          # (the archives alone don't define LLVMContextCreate etc.).
+          cp llvm/tools/llvm-shlib/libllvm.cpp "dist/$NAME/"
+          ls "dist/$NAME/lib" > "dist/$NAME/MANIFEST.txt"
+          tar -C dist -czf "$NAME.tar.gz" "$NAME"
+          sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          generate_release_notes: true
+          body: |
+            Static LLVM ${{ inputs.release_tag }} libraries built from branch slim-21.1.8.
+            X86 + AArch64 codegen, no zlib/zstd/libxml2, static CRT on Windows (/MT).
+            Each archive contains: lib/ (component static archives), include/,
+            libllvm.cpp (C API wrapper — compile it on the consumer side),
+            MANIFEST.txt (archive list). Windows additionally carries LLVM-C.dll
+            + import lib + the ordered libllvm-c.args link manifest.
+          files: |
+            llvm-static-*.tar.gz
+            llvm-static-*.tar.gz.sha256
