@@ -43,6 +43,10 @@ jobs:
           EXTRA=""
           if [ "$RUNNER_OS" = "Windows" ]; then
             EXTRA="-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DLLVM_ENABLE_DIA_SDK=OFF"
+          else
+            # Full-symbol libLLVM shared library (all C API symbols included):
+            # the runtime-loadable companion for Frond's Lib.open / Lib.embed.
+            EXTRA="-DLLVM_BUILD_LLVM_DYLIB=ON"
           fi
           if [ -n "${{ matrix.osx_arch }}" ]; then
             EXTRA="$EXTRA -DCMAKE_OSX_ARCHITECTURES=${{ matrix.osx_arch }}"
@@ -63,17 +67,18 @@ jobs:
             $EXTRA
 
       # llvm-libraries: aggregate target that depends on every LLVM component
-      # library; works uniformly on all platforms (LLVM_BUILD_LLVM_C_DYLIB is
-      # only supported on Darwin/MSVC, so it is left at its platform default).
-      # Windows additionally builds LLVM-C (on by default under MSVC) to get
-      # the dll + the ordered libllvm-c.args link manifest.
+      # library; works uniformly on all platforms. Windows additionally builds
+      # LLVM-C (on by default under MSVC) to get the dll + the ordered
+      # libllvm-c.args link manifest. Unix additionally builds the LLVM dylib
+      # target (LLVM_BUILD_LLVM_DYLIB) so the archive carries a runtime-loadable
+      # shared library alongside the static archives.
       - name: Build
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
             cmake --build build --target llvm-libraries LLVM-C
           else
-            cmake --build build --target llvm-libraries
+            cmake --build build --target llvm-libraries LLVM
           fi
 
       - name: Package
@@ -88,6 +93,10 @@ jobs:
             cp build/libllvm-c.args "dist/$NAME/" 2>/dev/null || true
           else
             cp build/lib/*.a "dist/$NAME/lib/"
+            # Runtime-loadable libLLVM (dlopen/dylib) alongside the archives.
+            # -L dereferences the versioned symlink to the real binary.
+            cp -L build/lib/libLLVM.dylib "dist/$NAME/lib/" 2>/dev/null || \
+              cp -L build/lib/libLLVM.so "dist/$NAME/lib/" 2>/dev/null || true
           fi
           # Headers: source tree + generated Config headers merged.
           cp -R llvm/include/. "dist/$NAME/include/"
@@ -111,6 +120,8 @@ jobs:
             libllvm.cpp (C API wrapper — compile it on the consumer side),
             MANIFEST.txt (archive list). Windows additionally carries LLVM-C.dll
             + import lib + the ordered libllvm-c.args link manifest.
+            Unix additionally carries the full-symbol libLLVM shared library
+            (.so / .dylib) — runtime-loadable via dlopen, all C API symbols.
           files: |
             llvm-static-*.tar.gz
             llvm-static-*.tar.gz.sha256
