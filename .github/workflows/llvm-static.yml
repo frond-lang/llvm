@@ -198,11 +198,19 @@ jobs:
                      libkernel32.a libmsvcrt.a libws2_32.a libadvapi32.a libuser32.a; do
               cp "$MGW/$f" "dist/$NAME/linkview/"
             done
-            # GCC runtime sits in the versioned dir; availability varies by
-            # build (seh folds eh into libgcc.a) — copy what exists.
-            GCCDIR="$(ls -d "$MGWROOT"/lib/gcc/x86_64-w64-mingw32/*/ | sort -V | tail -1)"
+            # GCC runtime lives split across TWO sibling dirs
+            # (…/16.1.0/ holds libgcc.a+libgcc_eh.a, …/lib/ holds libgcc_s.a)
+            # — discover each file by NAME, never by directory guessing.
+            # libgcc.a and libwinpthread.a are hard requirements (posix-flavor
+            # mingw links against them); _eh/_s are best-effort.
             for f in libgcc.a libgcc_eh.a libgcc_s.a libwinpthread.a; do
-              cp "$GCCDIR/$f" "dist/$NAME/linkview/" 2>/dev/null || true
+              src="$(find "$MGWROOT" -name "$f" -not -path "*/opt/*" | head -1)"
+              if [ -n "$src" ]; then
+                cp "$src" "dist/$NAME/linkview/"
+              elif [ "$f" = "libgcc.a" ] || [ "$f" = "libwinpthread.a" ]; then
+                echo "FATAL: $f not found under $MGWROOT" >&2
+                exit 1
+              fi
             done
             printf 'mingw-w64 CRT + import archives (msvcrt flavor).\nFloor: any x64 Windows (msvcrt.dll + kernel32.dll ship with the OS).\nProvenance: niXman mingw-builds 16.1.0 msvcrt-rt_v14-rev0 (pinned URL),\nmingw-w64 runtime — permissive licensing, bundle-ok.\n' \
               > "dist/$NAME/linkview/README.txt"
@@ -355,6 +363,9 @@ jobs:
           # keeps dl/m separate; newer glibcs ship stub libdl.so.2. If a
           # future image drops it entirely, skip with a note instead of
           # failing the whole package step.
+          # libc_nonshared.a(__libc_csu_init/fini 的家;吃真身 libc.so.6
+          # 而非链接脚本时必需,否则 Scrt1.o 的 _start 引用悬空)。
+          cp -L "$(gcc -print-file-name=libc_nonshared.a)" "dist/$NAME/linkview/libc_nonshared.a"
           for f in libc.so.6 libm.so.6 libdl.so.2; do
             if [ -e "/usr/lib64/$f" ]; then
               cp -L "/usr/lib64/$f" "dist/$NAME/linkview/$f"
