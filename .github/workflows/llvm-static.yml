@@ -125,7 +125,11 @@ jobs:
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_INCLUDE_TESTS=OFF \
             $EXTRA
-          cmake --build build-lld --target lld
+          # -j 2: lld's heaviest TUs (SyntheticSections/Relocations) spike
+          # 2-4 GB each under gcc -O3; ninja's default parallelism (cores+2)
+          # rides the 16 GB runner edge and gets cc1plus OOM-killed (which
+          # fails with NO compiler diagnostic). 131 TUs at -j 2 costs minutes.
+          cmake --build build-lld --target lld -j 2
 
       - name: Check macOS deployment floor
         if: runner.os == 'macOS'
@@ -281,12 +285,19 @@ jobs:
 
       - name: Build lld
         run: |
+          # Observability: if this step fails again, memory/disk headroom at
+          # the start is the first thing to check (OOM kills leave no
+          # compiler diagnostic — ninja just reports "subcommand failed").
+          free -m 2>/dev/null || true
+          df -h . 2>/dev/null || true
           cmake -S lld -B build-lld -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_DIR="$PWD/build/lib/cmake/llvm" \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_INCLUDE_TESTS=OFF
-          cmake --build build-lld --target lld
+          # -j 2: see the native job's comment — gcc -O3 on lld's heaviest
+          # TUs spikes past what ninja's default parallelism fits in 16 GB.
+          cmake --build build-lld --target lld -j 2
 
       # 下限断言:libLLVM.so 与 lld 引用的最高 GLIBC 符号版本不得超过容器基线
       # (2.28)。防回归:换 runner/镜像或依赖变化时这步会红,而不是用户机器上
