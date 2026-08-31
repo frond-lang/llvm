@@ -335,10 +335,19 @@ jobs:
           for f in Scrt1.o crti.o crtn.o; do
             cp -L "$(gcc -print-file-name=$f)" "dist/$NAME/linkview/$f"
           done
-          for f in libc.so.6 libm.so.6 libdl.so.6; do
-            cp -L "/usr/lib64/$f" "dist/$NAME/linkview/$f"
+          # NOTE sonames: libc.so.6 / libm.so.6 / libdl.so.2 (libdl has NEVER
+          # had a .so.6 — its soname is .so.2 since forever). glibc < 2.34
+          # keeps dl/m separate; newer glibcs ship stub libdl.so.2. If a
+          # future image drops it entirely, skip with a note instead of
+          # failing the whole package step.
+          for f in libc.so.6 libm.so.6 libdl.so.2; do
+            if [ -e "/usr/lib64/$f" ]; then
+              cp -L "/usr/lib64/$f" "dist/$NAME/linkview/$f"
+            else
+              echo "note: /usr/lib64/$f absent on this image — skipping" >&2
+            fi
           done
-          printf 'manylinux_2_28 link view (glibc 2.28 floor).\nScrt1/crti/crtn from the image toolchain; libc/libm/libdl are the real\nruntime .so files, used at LINK TIME ONLY (targets run on their own glibc).\nLink with lld by absolute path against libc.so.6 (bypasses the missing\nglibc-dev linker script on end-user machines).\n' \
+          printf 'manylinux_2_28 link view (glibc 2.28 floor).\nScrt1/crti/crtn from the image toolchain; libc.so.6/libm.so.6/libdl.so.2 are\nthe real runtime .so files, used at LINK TIME ONLY (targets run on their own\nglibc). Link with lld by absolute path against libc.so.6 (bypasses the\nmissing glibc-dev linker script on end-user machines).\n' \
             > "dist/$NAME/linkview/README.txt"
           ls "dist/$NAME/lib" > "dist/$NAME/MANIFEST.txt"
           ls "dist/$NAME/bin" "dist/$NAME/linkview" >> "dist/$NAME/MANIFEST.txt"
