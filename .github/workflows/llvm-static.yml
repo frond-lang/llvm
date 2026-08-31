@@ -11,21 +11,41 @@ on:
 permissions:
   contents: write
 
+# ─────────────────────────────────────────────────────────────────────────────
+# frond 工具链资产集(BOOTSTRAP_PLAN 4b/4c)。每个 triple 的 tarball 含:
+#   lib/       LLVM-C 动态库(Windows)+ 组件静态档;Unix 侧 libLLVM 全符号共享库
+#   include/   头文件;/ libllvm.cpp(真静态链接用 C 包装)
+#   bin/lld    自包含链接器可执行(与同一 LLVM 构建静态互链,frondc spawn 调用;
+#              lld 无 C API,永不进程内)
+#   linkview/  钉死产物下限的链接视图:Linux = manylinux_2_28(glibc 2.28)的
+#              crt + 真身 libc/libm/libdl;Windows = mingw-w64 crt + import 档案
+#              (msvcrt flavor,一切 x64 Windows);macOS 零资产(libSystem 随系统)
+# C 层预编译 .obj(std C 原语 + frond_rt)不在此管道 —— 归 Frond 仓库 release CI。
+#
+# Linux glibc 基线 = 2.28(manylinux_2_28):这是机制允许的下限 —— actions 的
+# node20 运行时自身要求 glibc ≥ 2.28,manylinux2014(2.17)容器无法执行任何
+# step;且 LLVM 21 需 gcc ≥ 11,centos7 生态已 EOL。覆盖 RHEL8+/Ubuntu 20.04+。
+# macOS 基线:显式 CMAKE_OSX_DEPLOYMENT_TARGET=11.0(否则 macos-latest SDK 默认
+# 值会写进 dylib,老 macOS 直接拒载 —— macOS 版的 glibc 事故)。
+# ─────────────────────────────────────────────────────────────────────────────
+
+env:
+  OSX_DEPLOY_TARGET: '11.0'
+
 jobs:
-  build:
+  # ── macOS / Windows:裸 runner(与旧管线相同路径)────────────────────────
+  build-native:
     name: ${{ matrix.triple }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,    triple: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu }
-          - { os: macos-latest,     triple: aarch64-apple-darwin }
+          - { os: macos-latest,   triple: aarch64-apple-darwin }
           # Intel macOS runners are retired; cross-compile x86_64 on arm64
           # (Rosetta runs the x86_64 tablegen binaries).
-          - { os: macos-latest,     triple: x86_64-apple-darwin, osx_arch: x86_64 }
-          - { os: windows-latest,   triple: x86_64-pc-windows-msvc }
+          - { os: macos-latest,   triple: x86_64-apple-darwin, osx_arch: x86_64 }
+          - { os: windows-latest, triple: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -37,7 +57,7 @@ jobs:
         with:
           arch: x64
 
-      - name: Configure
+      - name: Configure LLVM
         shell: bash
         run: |
           EXTRA=""
@@ -46,7 +66,7 @@ jobs:
           else
             # Full-symbol libLLVM shared library (all C API symbols included):
             # the runtime-loadable companion for Frond's Lib.open / Lib.embed.
-            EXTRA="-DLLVM_BUILD_LLVM_DYLIB=ON"
+            EXTRA="-DLLVM_BUILD_LLVM_DYLIB=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=$OSX_DEPLOY_TARGET"
           fi
           if [ -n "${{ matrix.osx_arch }}" ]; then
             EXTRA="$EXTRA -DCMAKE_OSX_ARCHITECTURES=${{ matrix.osx_arch }}"
@@ -72,7 +92,7 @@ jobs:
       # libllvm-c.args link manifest. Unix additionally builds the LLVM dylib
       # target (LLVM_BUILD_LLVM_DYLIB) so the archive carries a runtime-loadable
       # shared library alongside the static archives.
-      - name: Build
+      - name: Build LLVM
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
@@ -81,22 +101,55 @@ jobs:
             cmake --build build --target llvm-libraries LLVM
           fi
 
+      # lld: standalone build against the just-built LLVM tree (version-locked
+      # by construction). Static interlink → self-contained executable that
+      # frondc spawns; the universal driver dispatches lld-link/ld.lld/ld64.lld.
+      - name: Build lld
+        shell: bash
+        run: |
+          EXTRA=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            EXTRA="-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
+          else
+            EXTRA="-DCMAKE_OSX_DEPLOYMENT_TARGET=$OSX_DEPLOY_TARGET"
+          fi
+          if [ -n "${{ matrix.osx_arch }}" ]; then
+            EXTRA="$EXTRA -DCMAKE_OSX_ARCHITECTURES=${{ matrix.osx_arch }}"
+          fi
+          cmake -S lld -B build-lld -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="$PWD/build/lib/cmake/llvm" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            $EXTRA
+          cmake --build build-lld --target lld
+
+      - name: Check macOS deployment floor
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          minos="$(otool -l build/lib/libLLVM.dylib | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')"
+          echo "libLLVM.dylib minos: ${minos:-<none>}"
+          [ "$minos" = "$OSX_DEPLOY_TARGET" ]
+
       - name: Package
         shell: bash
         run: |
           set -euxo pipefail
           NAME="llvm-static-${{ matrix.triple }}"
-          mkdir -p "dist/$NAME/lib" "dist/$NAME/include"
+          mkdir -p "dist/$NAME/lib" "dist/$NAME/include" "dist/$NAME/bin" "dist/$NAME/linkview"
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp build/lib/*.lib "dist/$NAME/lib/"
             cp build/bin/LLVM-C.dll "dist/$NAME/lib/" 2>/dev/null || true
             cp build/libllvm-c.args "dist/$NAME/" 2>/dev/null || true
+            cp build-lld/bin/lld.exe "dist/$NAME/bin/"
           else
             cp build/lib/*.a "dist/$NAME/lib/"
             # Runtime-loadable libLLVM (dlopen/dylib) alongside the archives.
             # -L dereferences the versioned symlink to the real binary.
             cp -L build/lib/libLLVM.dylib "dist/$NAME/lib/" 2>/dev/null || \
-              cp -L build/lib/libLLVM.so "dist/$NAME/lib/" 2>/dev/null || true
+            cp -L build/lib/libLLVM.so "dist/$NAME/lib/" 2>/dev/null || true
+            cp build-lld/bin/lld "dist/$NAME/bin/"
           fi
           # Headers: source tree + generated Config headers merged.
           cp -R llvm/include/. "dist/$NAME/include/"
@@ -104,7 +157,31 @@ jobs:
           # C API wrapper source: consumer compiles it for true-static linking
           # (the archives alone don't define LLVMContextCreate etc.).
           cp llvm/tools/llvm-shlib/libllvm.cpp "dist/$NAME/"
+          # ── linkview ──
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # mingw-w64 CRT + import archives (permissive licensing, bundle-ok):
+            # produced exes link msvcrt.dll/kernel32.dll — frozen OS components,
+            # so the floor is every x64 Windows ever shipped.
+            choco install -y --no-progress mingw
+            MGWROOT="/c/ProgramData/mingw64/mingw64"
+            MGW="$MGWROOT/x86_64-w64-mingw32/lib"
+            [ -d "$MGW" ] || MGW="$MGWROOT/lib"
+            for f in crt2.o dllcrt2.o crtbegin.o crtend.o \
+                     libmingw32.a libmingwex.a libgcc.a libgcc_eh.a \
+                     libkernel32.a libmsvcrt.a libws2_32.a libadvapi32.a libuser32.a; do
+              cp "$MGW/$f" "dist/$NAME/linkview/"
+            done
+            printf 'mingw-w64 CRT + import archives (msvcrt flavor).\nFloor: any x64 Windows (msvcrt.dll + kernel32.dll ship with the OS).\nProvenance: chocolatey "mingw" package (mingw-w64 runtime, permissive).\n' \
+              > "dist/$NAME/linkview/README.txt"
+          else
+            # macOS needs no link-view assets: /usr/lib/libSystem.dylib is
+            # universal and always present; the floor is pinned at link time
+            # via lld -platform_version (BOOTSTRAP_PLAN 4c).
+            printf 'macOS: no link-view assets needed (/usr/lib/libSystem.dylib).\nPin the floor at link time: lld -platform_version macos 11.0 <sdk>.\n' \
+              > "dist/$NAME/linkview/README.txt"
+          fi
           ls "dist/$NAME/lib" > "dist/$NAME/MANIFEST.txt"
+          ls "dist/$NAME/bin" "dist/$NAME/linkview" >> "dist/$NAME/MANIFEST.txt"
           tar -C dist -czf "$NAME.tar.gz" "$NAME"
           sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
 
@@ -118,10 +195,126 @@ jobs:
             X86 + AArch64 codegen, no zlib/zstd/libxml2, static CRT on Windows (/MT).
             Each archive contains: lib/ (component static archives), include/,
             libllvm.cpp (C API wrapper — compile it on the consumer side),
-            MANIFEST.txt (archive list). Windows additionally carries LLVM-C.dll
-            + import lib + the ordered libllvm-c.args link manifest.
-            Unix additionally carries the full-symbol libLLVM shared library
-            (.so / .dylib) — runtime-loadable via dlopen, all C API symbols.
+            bin/lld (self-contained linker: lld-link / ld.lld / ld64.lld by argv),
+            linkview/ (pinned link-view assets: mingw CRT + import archives on
+            Windows; README only on macOS — libSystem is universal), and
+            MANIFEST.txt. Windows additionally carries LLVM-C.dll + import lib
+            + the ordered libllvm-c.args link manifest. Unix additionally
+            carries the full-symbol libLLVM shared library (.so / .dylib) —
+            runtime-loadable via dlopen, all C API symbols.
+          files: |
+            llvm-static-*.tar.gz
+            llvm-static-*.tar.gz.sha256
+
+  # ── Linux:manylinux_2_28 容器(glibc 2.28 地板 = 机制允许的下限)─────────
+  build-linux:
+    name: ${{ matrix.triple }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    triple: x86_64-unknown-linux-gnu,  container: "quay.io/pypa/manylinux_2_28_x86_64:latest" }
+          - { os: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu, container: "quay.io/pypa/manylinux_2_28_aarch64:latest" }
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # manylinux_2_28 ships a devtoolset gcc (≥ 12) as the default compiler and
+      # python3/pip. Verify and only fall back to an explicit toolset install.
+      - name: Toolchain
+        run: |
+          gcc --version | head -1
+          python3 -m pip install --quiet cmake ninja
+          cmake --version | head -1
+          ninja --version
+
+      - name: Configure LLVM
+        run: |
+          cmake -S llvm -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -D LLVM_TARGETS_TO_BUILD="X86;AArch64" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_PLUGINS=OFF \
+            -DLLVM_APPEND_VC_REV=OFF \
+            -DLLVM_BUILD_LLVM_DYLIB=ON
+
+      - name: Build LLVM
+        run: |
+          cmake --build build --target llvm-libraries LLVM
+
+      - name: Build lld
+        run: |
+          cmake -S lld -B build-lld -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="$PWD/build/lib/cmake/llvm" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF
+          cmake --build build-lld --target lld
+
+      # 下限断言:libLLVM.so 与 lld 引用的最高 GLIBC 符号版本不得超过容器基线
+      # (2.28)。防回归:换 runner/镜像或依赖变化时这步会红,而不是用户机器上
+      # 炸 dlopen。
+      - name: Check glibc floor
+        run: |
+          set -euxo pipefail
+          FLOOR=GLIBC_2.28
+          for f in build/lib/libLLVM.so* build-lld/bin/lld; do
+            maxg="$(objdump -T "$f" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sort -uV | tail -1 || true)"
+            echo "$f → ${maxg:-<none>}"
+            [ -n "$maxg" ] || continue
+            [ "$(printf '%s\n' "$FLOOR" "$maxg" | sort -V | tail -1)" = "$FLOOR" ]
+          done
+
+      - name: Package
+        run: |
+          set -euxo pipefail
+          NAME="llvm-static-${{ matrix.triple }}"
+          mkdir -p "dist/$NAME/lib" "dist/$NAME/include" "dist/$NAME/bin" "dist/$NAME/linkview"
+          cp build/lib/*.a "dist/$NAME/lib/"
+          cp -L build/lib/libLLVM.so "dist/$NAME/lib/" 2>/dev/null || true
+          cp build-lld/bin/lld "dist/$NAME/bin/"
+          cp -R llvm/include/. "dist/$NAME/include/"
+          cp -R build/include/. "dist/$NAME/include/"
+          cp llvm/tools/llvm-shlib/libllvm.cpp "dist/$NAME/"
+          # ── linkview:容器自身的 crt + 真身 libc(glibc 2.28 地板)─────────
+          # gcc -print-file-name 解析当前工具链的确切路径(不猜目录)。
+          # glibc 2.34 之前 dl/m 尚未并入 libc → 三件都带(frndc 自身 dlopen
+          # libLLVM 需要 libdl;数学例程按需 libm)。
+          for f in Scrt1.o crti.o crtn.o; do
+            cp -L "$(gcc -print-file-name=$f)" "dist/$NAME/linkview/$f"
+          done
+          for f in libc.so.6 libm.so.6 libdl.so.6; do
+            cp -L "/usr/lib64/$f" "dist/$NAME/linkview/$f"
+          done
+          printf 'manylinux_2_28 link view (glibc 2.28 floor).\nScrt1/crti/crtn from the image toolchain; libc/libm/libdl are the real\nruntime .so files, used at LINK TIME ONLY (targets run on their own glibc).\nLink with lld by absolute path against libc.so.6 (bypasses the missing\nglibc-dev linker script on end-user machines).\n' \
+            > "dist/$NAME/linkview/README.txt"
+          ls "dist/$NAME/lib" > "dist/$NAME/MANIFEST.txt"
+          ls "dist/$NAME/bin" "dist/$NAME/linkview" >> "dist/$NAME/MANIFEST.txt"
+          tar -C dist -czf "$NAME.tar.gz" "$NAME"
+          sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          generate_release_notes: true
+          body: |
+            Static LLVM libraries built from branch slim-21.1.8 (manylinux_2_28,
+            glibc 2.28 floor — asserted by the Check glibc floor step).
+            X86 + AArch64 codegen, no zlib/zstd/libxml2. Contains: lib/ (static
+            archives + full-symbol libLLVM.so), include/, libllvm.cpp, bin/lld
+            (self-contained linker), linkview/ (crt + real libc/libm/libdl for
+            pinned-floor linking) and MANIFEST.txt.
           files: |
             llvm-static-*.tar.gz
             llvm-static-*.tar.gz.sha256

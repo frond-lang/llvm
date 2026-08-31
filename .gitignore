@@ -3,4 +3,5 @@
 build-slim/
 build-verify/
 build/
+build-lld/
 *.log
