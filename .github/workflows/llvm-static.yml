@@ -13,13 +13,16 @@ permissions:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # frond 工具链资产集(BOOTSTRAP_PLAN 4b/4c)。每个 triple 的 tarball 含:
-#   lib/       LLVM-C 动态库(Windows)+ 组件静态档;Unix 侧 libLLVM 全符号共享库
-#   include/   头文件;/ libllvm.cpp(真静态链接用 C 包装)
+#   lib/       统一文件名 llvm.dll / llvm.so / llvm.dylib(Frond 永远按显式
+#              路径 dlopen/LoadLibrary,文件名不参与符号搜索,故统一安全;
+#              Windows 的 import 库配对改为 llvm.lib) + 组件静态档 +
+#              libllvm.cpp(真静态链接用 C 包装)
 #   bin/lld    自包含链接器可执行(与同一 LLVM 构建静态互链,frondc spawn 调用;
 #              lld 无 C API,永不进程内)
 #   linkview/  钉死产物下限的链接视图:Linux = manylinux_2_28(glibc 2.28)的
 #              crt + 真身 libc/libm/libdl;Windows = mingw-w64 crt + import 档案
 #              (msvcrt flavor,一切 x64 Windows);macOS 零资产(libSystem 随系统)
+#   VERSION    版本标识(文件名不再隐含版本,由 tag/MANIFEST/VERSION 承载)
 # C 层预编译 .obj(std C 原语 + frond_rt)不在此管道 —— 归 Frond 仓库 release CI。
 #
 # Linux glibc 基线 = 2.28(manylinux_2_28):这是机制允许的下限 —— actions 的
@@ -140,15 +143,23 @@ jobs:
           mkdir -p "dist/$NAME/lib" "dist/$NAME/include" "dist/$NAME/bin" "dist/$NAME/linkview"
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp build/lib/*.lib "dist/$NAME/lib/"
-            cp build/bin/LLVM-C.dll "dist/$NAME/lib/" 2>/dev/null || true
+            # Uniform asset name: dll + import lib pair → llvm.dll / llvm.lib.
+            # Frond only ever loads by explicit path (dlopen semantics), and
+            # link-by-import-name is a non-path in the Frond design — the pair
+            # rename just removes the temptation. The dll's internal name
+            # (LLVM-C.dll) is irrelevant to LoadLibraryW-by-path.
+            mv "dist/$NAME/lib/LLVM-C.lib" "dist/$NAME/lib/llvm.lib" 2>/dev/null || true
+            cp build/bin/LLVM-C.dll "dist/$NAME/lib/llvm.dll" 2>/dev/null || true
             cp build/libllvm-c.args "dist/$NAME/" 2>/dev/null || true
             cp build-lld/bin/lld.exe "dist/$NAME/bin/"
           else
             cp build/lib/*.a "dist/$NAME/lib/"
-            # Runtime-loadable libLLVM (dlopen/dylib) alongside the archives.
-            # -L dereferences the versioned symlink to the real binary.
-            cp -L build/lib/libLLVM.dylib "dist/$NAME/lib/" 2>/dev/null || \
-            cp -L build/lib/libLLVM.so "dist/$NAME/lib/" 2>/dev/null || true
+            # Runtime-loadable LLVM shared library alongside the archives,
+            # shipped under the uniform name (-L dereferences the versioned
+            # symlink to the real binary; SONAME/install_name don't matter
+            # for dlopen-by-path).
+            cp -L build/lib/libLLVM.dylib "dist/$NAME/lib/llvm.dylib" 2>/dev/null || \
+            cp -L build/lib/libLLVM.so "dist/$NAME/lib/llvm.so" 2>/dev/null || true
             cp build-lld/bin/lld "dist/$NAME/bin/"
           fi
           # Headers: source tree + generated Config headers merged.
@@ -157,6 +168,9 @@ jobs:
           # C API wrapper source: consumer compiles it for true-static linking
           # (the archives alone don't define LLVMContextCreate etc.).
           cp llvm/tools/llvm-shlib/libllvm.cpp "dist/$NAME/"
+          # Version stamp: the uniform lib/llvm.* name no longer encodes it.
+          printf 'llvm 21.1.8 slim (X86+AArch64)\nrelease tag: %s\n' \
+            "${{ inputs.release_tag }}" > "dist/$NAME/VERSION"
           # ── linkview ──
           if [ "$RUNNER_OS" = "Windows" ]; then
             # mingw-w64 CRT + import archives (permissive licensing, bundle-ok):
@@ -193,15 +207,16 @@ jobs:
           body: |
             Static LLVM libraries built from branch slim-21.1.8.
             X86 + AArch64 codegen, no zlib/zstd/libxml2, static CRT on Windows (/MT).
-            Each archive contains: lib/ (component static archives), include/,
-            libllvm.cpp (C API wrapper — compile it on the consumer side),
-            bin/lld (self-contained linker: lld-link / ld.lld / ld64.lld by argv),
-            linkview/ (pinned link-view assets: mingw CRT + import archives on
-            Windows; README only on macOS — libSystem is universal), and
-            MANIFEST.txt. Windows additionally carries LLVM-C.dll + import lib
-            + the ordered libllvm-c.args link manifest. Unix additionally
-            carries the full-symbol libLLVM shared library (.so / .dylib) —
-            runtime-loadable via dlopen, all C API symbols.
+            Each archive contains: lib/ (component static archives plus the
+            runtime-loadable LLVM shared library under the uniform name
+            llvm.dll / llvm.so / llvm.dylib — load it by explicit path only),
+            include/, libllvm.cpp (C API wrapper — compile it on the consumer
+            side), bin/lld (self-contained linker: lld-link / ld.lld / ld64.lld
+            by argv), linkview/ (pinned link-view assets: mingw CRT + import
+            archives on Windows; README only on macOS — libSystem is universal),
+            VERSION and MANIFEST.txt. Windows additionally carries the llvm.lib
+            import pair + the ordered libllvm-c.args link manifest. The shared
+            library exports all C API symbols (runtime-loadable via dlopen).
           files: |
             llvm-static-*.tar.gz
             llvm-static-*.tar.gz.sha256
@@ -281,11 +296,15 @@ jobs:
           NAME="llvm-static-${{ matrix.triple }}"
           mkdir -p "dist/$NAME/lib" "dist/$NAME/include" "dist/$NAME/bin" "dist/$NAME/linkview"
           cp build/lib/*.a "dist/$NAME/lib/"
-          cp -L build/lib/libLLVM.so "dist/$NAME/lib/" 2>/dev/null || true
+          # Runtime-loadable LLVM shared library, uniform name (dlopen-by-path;
+          # SONAME irrelevant). -L dereferences the versioned symlink.
+          cp -L build/lib/libLLVM.so "dist/$NAME/lib/llvm.so" 2>/dev/null || true
           cp build-lld/bin/lld "dist/$NAME/bin/"
           cp -R llvm/include/. "dist/$NAME/include/"
           cp -R build/include/. "dist/$NAME/include/"
           cp llvm/tools/llvm-shlib/libllvm.cpp "dist/$NAME/"
+          printf 'llvm 21.1.8 slim (X86+AArch64)\nrelease tag: %s\n' \
+            "${{ inputs.release_tag }}" > "dist/$NAME/VERSION"
           # ── linkview:容器自身的 crt + 真身 libc(glibc 2.28 地板)─────────
           # gcc -print-file-name 解析当前工具链的确切路径(不猜目录)。
           # glibc 2.34 之前 dl/m 尚未并入 libc → 三件都带(frndc 自身 dlopen
@@ -312,9 +331,10 @@ jobs:
             Static LLVM libraries built from branch slim-21.1.8 (manylinux_2_28,
             glibc 2.28 floor — asserted by the Check glibc floor step).
             X86 + AArch64 codegen, no zlib/zstd/libxml2. Contains: lib/ (static
-            archives + full-symbol libLLVM.so), include/, libllvm.cpp, bin/lld
+            archives + the runtime-loadable LLVM shared library as lib/llvm.so,
+            load by explicit path), include/, libllvm.cpp, bin/lld
             (self-contained linker), linkview/ (crt + real libc/libm/libdl for
-            pinned-floor linking) and MANIFEST.txt.
+            pinned-floor linking), VERSION and MANIFEST.txt.
           files: |
             llvm-static-*.tar.gz
             llvm-static-*.tar.gz.sha256
