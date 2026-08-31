@@ -237,12 +237,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # manylinux_2_28 ships a devtoolset gcc (≥ 12) as the default compiler and
-      # python3/pip. Verify and only fall back to an explicit toolset install.
+      # manylinux_2_28 ships gcc 14 as the default compiler and a set of
+      # bundled Pythons under /opt/python/ (the SYSTEM python3 has no pip).
+      # Install cmake/ninja via the newest bundled Python and symlink them
+      # into /usr/local/bin so every later step (and cmake's own Ninja
+      # lookup) finds them without PATH plumbing across steps.
       - name: Toolchain
         run: |
+          set -euxo pipefail
           gcc --version | head -1
-          python3 -m pip install --quiet cmake ninja
+          PY="$(ls -1d /opt/python/cp3*/bin/python3 2>/dev/null | sort -V | tail -1)"
+          if [ -n "$PY" ]; then
+            "$PY" -m pip install --quiet cmake ninja
+            BINDIR="$(dirname "$PY")"
+            ln -sf "$BINDIR/cmake" /usr/local/bin/cmake
+            ln -sf "$BINDIR/ninja" /usr/local/bin/ninja
+          else
+            dnf install -y cmake ninja-build
+          fi
           cmake --version | head -1
           ninja --version
 
