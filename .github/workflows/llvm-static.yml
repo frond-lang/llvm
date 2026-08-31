@@ -180,16 +180,31 @@ jobs:
             # mingw-w64 CRT + import archives (permissive licensing, bundle-ok):
             # produced exes link msvcrt.dll/kernel32.dll — frozen OS components,
             # so the floor is every x64 Windows ever shipped.
-            choco install -y --no-progress mingw
-            MGWROOT="/c/ProgramData/mingw64/mingw64"
+            #
+            # Pinned niXman msvcrt-flavor build, downloaded directly — the same
+            # artifact family chocolatey's `mingw` package wraps. Two reasons
+            # not to use choco: (1) its current pin is the UCRT flavor, which
+            # drifts from the msvcrt-floor decision (BOOTSTRAP_PLAN 4c);
+            # (2) GCC 16 keeps libgcc.a in the versioned
+            # lib/gcc/x86_64-w64-mingw32/<ver>/ dir, not the plain lib dir.
+            MGW_URL="https://github.com/niXman/mingw-builds-binaries/releases/download/16.1.0-rt_v14-rev0/x86_64-16.1.0-release-posix-seh-msvcrt-rt_v14-rev0.7z"
+            curl -sL --retry 3 -o "$RUNNER_TEMP/mingw.7z" "$MGW_URL"
+            7z x -y -o"$RUNNER_TEMP/mingw-extract" "$RUNNER_TEMP/mingw.7z" >/dev/null
+            MGWROOT="$RUNNER_TEMP/mingw-extract/mingw64"
             MGW="$MGWROOT/x86_64-w64-mingw32/lib"
             [ -d "$MGW" ] || MGW="$MGWROOT/lib"
             for f in crt2.o dllcrt2.o crtbegin.o crtend.o \
-                     libmingw32.a libmingwex.a libgcc.a libgcc_eh.a \
+                     libmingw32.a libmingwex.a \
                      libkernel32.a libmsvcrt.a libws2_32.a libadvapi32.a libuser32.a; do
               cp "$MGW/$f" "dist/$NAME/linkview/"
             done
-            printf 'mingw-w64 CRT + import archives (msvcrt flavor).\nFloor: any x64 Windows (msvcrt.dll + kernel32.dll ship with the OS).\nProvenance: chocolatey "mingw" package (mingw-w64 runtime, permissive).\n' \
+            # GCC runtime sits in the versioned dir; availability varies by
+            # build (seh folds eh into libgcc.a) — copy what exists.
+            GCCDIR="$(ls -d "$MGWROOT"/lib/gcc/x86_64-w64-mingw32/*/ | sort -V | tail -1)"
+            for f in libgcc.a libgcc_eh.a libgcc_s.a libwinpthread.a; do
+              cp "$GCCDIR/$f" "dist/$NAME/linkview/" 2>/dev/null || true
+            done
+            printf 'mingw-w64 CRT + import archives (msvcrt flavor).\nFloor: any x64 Windows (msvcrt.dll + kernel32.dll ship with the OS).\nProvenance: niXman mingw-builds 16.1.0 msvcrt-rt_v14-rev0 (pinned URL),\nmingw-w64 runtime — permissive licensing, bundle-ok.\n' \
               > "dist/$NAME/linkview/README.txt"
           else
             # macOS needs no link-view assets: /usr/lib/libSystem.dylib is
